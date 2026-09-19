@@ -1,61 +1,153 @@
-#!/bin/bash
-set -u
+#!/usr/bin/env bash
+set -euo pipefail
 
-SERVICE="shadowsocks-rust"
+REPO_API="https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest"
 BIN="/usr/local/bin/ssserver"
+SERVICE="shadowsocks-rust.service"
+CONFIG="/etc/shadowsocks-rust/config.json"
 
-CURRENT="$($BIN --version 2>/dev/null | awk '{print $2}')"
-LATEST_TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/shadowsocks/shadowsocks-rust/releases/latest | sed 's#.*/##')"
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "错误：请使用 root 权限运行。"; exit 1; }
+}
 
-if [ -z "$LATEST_TAG" ]; then
-  echo "获取最新版本失败。"
-  exit 1
-fi
+need_cmds() {
+  local missing=()
+  for c in curl jq tar xz sha256sum install; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if ((${#missing[@]})); then
+    echo "缺少依赖：${missing[*]}"
+    echo "Debian/Ubuntu：apt-get update && apt-get install -y curl jq xz-utils coreutils"
+    exit 1
+  fi
+}
 
-LATEST="${LATEST_TAG#v}"
+arch_asset_suffix() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "x86_64-unknown-linux-musl.tar.xz" ;;
+    aarch64|arm64) echo "aarch64-unknown-linux-musl.tar.xz" ;;
+    *)
+      echo "错误：当前仅自动支持 x86_64 / aarch64，检测到：$(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
 
-echo "当前版本: $CURRENT"
-echo "最新版本: $LATEST"
+latest_info() {
+  curl -fsSL --retry 3 --connect-timeout 10 "$REPO_API"
+}
 
-if [ "$CURRENT" = "$LATEST" ]; then
-  echo "已经是最新版本，无需更新。"
-  exit 0
-fi
+latest_version() {
+  latest_info | jq -r '.tag_name'
+}
 
-read -r -p "是否更新到 $LATEST？[y/N]: " yn
-case "$yn" in
-  y|Y) ;;
-  *) echo "已取消"; exit 0 ;;
+current_version() {
+  if [[ -x "$BIN" ]]; then
+    "$BIN" --version 2>/dev/null | head -n1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+  fi
+}
+
+download_and_install() {
+  need_root
+  need_cmds
+
+  local json tag ver suffix asset url sha_url td
+  json="$(latest_info)"
+  tag="$(jq -r '.tag_name' <<<"$json")"
+  ver="${tag#v}"
+  suffix="$(arch_asset_suffix)"
+  asset="shadowsocks-v${ver}.${suffix}"
+
+  url="$(jq -r --arg a "$asset" '.assets[] | select(.name==$a) | .browser_download_url' <<<"$json" | head -n1)"
+  sha_url="$(jq -r --arg a "${asset}.sha256" '.assets[] | select(.name==$a) | .browser_download_url' <<<"$json" | head -n1)"
+
+  [[ -n "$url" && "$url" != "null" ]] || { echo "错误：官方 Release 未找到资产：$asset"; exit 1; }
+  [[ -n "$sha_url" && "$sha_url" != "null" ]] || { echo "错误：官方 Release 未找到校验文件：${asset}.sha256"; exit 1; }
+
+  td="$(mktemp -d)"
+  trap 'rm -rf "$td"' EXIT
+
+  echo "官方最新版本：$tag"
+  echo "架构：$(uname -m)"
+  echo "下载：$asset"
+
+  curl -fL --retry 3 --connect-timeout 10 -o "$td/$asset" "$url"
+  curl -fsSL --retry 3 --connect-timeout 10 -o "$td/$asset.sha256" "$sha_url"
+
+  (
+    cd "$td"
+    # 官方 sha256 文件通常包含“hash filename”；兼容只含 hash 的情况。
+    if grep -q "$asset" "$asset.sha256"; then
+      sha256sum -c "$asset.sha256"
+    else
+      expected="$(awk '{print $1}' "$asset.sha256" | head -n1)"
+      actual="$(sha256sum "$asset" | awk '{print $1}')"
+      [[ "$expected" == "$actual" ]] || { echo "SHA256 校验失败"; exit 1; }
+      echo "$asset: OK"
+    fi
+  )
+
+  mkdir -p "$td/extract"
+  tar -xJf "$td/$asset" -C "$td/extract"
+  local newbin
+  newbin="$(find "$td/extract" -type f -name ssserver -print -quit)"
+  [[ -n "$newbin" ]] || { echo "错误：压缩包内未找到 ssserver"; exit 1; }
+
+  "$newbin" --version >/dev/null 2>&1 || { echo "错误：下载的 ssserver 无法运行"; exit 1; }
+
+  local backup=""
+  if [[ -x "$BIN" ]]; then
+    backup="/usr/local/bin/ssserver.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$BIN" "$backup"
+    echo "旧版备份：$backup"
+  fi
+
+  install -m 0755 "$newbin" "$BIN"
+
+  if systemctl list-unit-files "$SERVICE" >/dev/null 2>&1 && [[ -f "$CONFIG" ]]; then
+    if systemctl restart "$SERVICE"; then
+      echo "服务重启成功。"
+    else
+      echo "错误：更新后服务启动失败。"
+      if [[ -n "$backup" && -f "$backup" ]]; then
+        cp -a "$backup" "$BIN"
+        systemctl restart "$SERVICE" || true
+        echo "已回滚旧版 ssserver。"
+      fi
+      exit 1
+    fi
+  fi
+
+  echo "ssserver 安装/更新完成：$("$BIN" --version 2>/dev/null | head -n1)"
+}
+
+check_cmd() {
+  need_cmds
+  local cur latest
+  cur="$(current_version)"
+  latest="$(latest_version)"
+  echo "本机版本：${cur:-未安装}"
+  echo "官方最新：$latest"
+  if [[ -z "$cur" ]]; then
+    return 2
+  fi
+  if [[ "v$cur" == "$latest" ]]; then
+    echo "状态：已是最新版本。"
+    return 0
+  fi
+  echo "状态：存在不同版本，可执行 ssupdate update。"
+  return 3
+}
+
+case "${1:-check}" in
+  check)
+    check_cmd || true
+    ;;
+  update|install|reinstall)
+    download_and_install
+    ;;
+  *)
+    echo "用法：ssupdate {check|update|install|reinstall}"
+    exit 1
+    ;;
 esac
-
-case "$(uname -m)" in
-  x86_64) TARGET="x86_64-unknown-linux-musl" ;;
-  aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
-  *) echo "不支持的架构: $(uname -m)"; exit 1 ;;
-esac
-
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST_TAG}/shadowsocks-${LATEST_TAG}.${TARGET}.tar.xz"
-
-echo "正在下载 $LATEST_TAG ..."
-
-curl -fL "$URL" -o "$TMP/shadowsocks.tar.xz" || exit 1
-tar -xJf "$TMP/shadowsocks.tar.xz" -C "$TMP" || exit 1
-
-cp "$BIN" "${BIN}.bak"
-install -m 755 "$TMP/ssserver" "$BIN"
-
-echo "正在重启服务..."
-
-if systemctl restart "$SERVICE" && sleep 2 && systemctl is-active --quiet "$SERVICE"; then
-  echo "更新成功！"
-  "$BIN" --version
-else
-  echo "新版本启动失败，正在恢复旧版本..."
-  cp "${BIN}.bak" "$BIN"
-  systemctl restart "$SERVICE"
-  echo "已恢复旧版本。"
-  exit 1
-fi

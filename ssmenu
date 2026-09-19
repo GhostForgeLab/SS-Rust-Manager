@@ -1,0 +1,690 @@
+#!/bin/bash
+
+CONFIG="/etc/shadowsocks-rust/config.json"
+SERVICE="shadowsocks-rust"
+BACKUP_DIR="/root/ssmenu-backups"
+
+pause() {
+  echo
+  read -rp "按回车继续..."
+}
+
+config_value() {
+  python3 - "$CONFIG" "$1" <<'PY'
+import sys, json
+try:
+    with open(sys.argv[1], "r") as f:
+        cfg = json.load(f)
+    print(cfg.get(sys.argv[2], "未知"))
+except Exception:
+    print("未知")
+PY
+}
+
+get_public_ip() {
+  local family="$1"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "未安装 curl"
+    return
+  fi
+
+  if [ "$family" = "4" ]; then
+    curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "获取失败"
+  else
+    curl -6fsS --max-time 5 https://api64.ipify.org 2>/dev/null || echo "无可用 IPv6"
+  fi
+}
+
+share_link() {
+  python3 - "$CONFIG" <<'PY'
+import sys, json, base64, urllib.request
+cfg=json.load(open(sys.argv[1]))
+method=cfg["method"]
+password=cfg["password"]
+port=cfg["server_port"]
+try:
+    ip=urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
+except Exception:
+    ip=input("无法自动获取公网IP，请输入VPS公网IPv4: ").strip()
+userinfo=base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+print(f"ss://{userinfo}@{ip}:{port}#MyVPS")
+PY
+}
+
+backup_config() {
+  mkdir -p "$BACKUP_DIR"
+
+  local stamp
+  local outfile
+  local unit_path
+  local ssupdate_path
+  local items=()
+  local rel_items=()
+
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  outfile="$BACKUP_DIR/ssmenu-backup-$stamp.tar.gz"
+
+  [ -f "$CONFIG" ] && items+=("$CONFIG")
+  [ -f /usr/local/bin/ssmenu ] && items+=("/usr/local/bin/ssmenu")
+
+  ssupdate_path="$(command -v ssupdate 2>/dev/null || true)"
+  [ -n "$ssupdate_path" ] && [ -f "$ssupdate_path" ] && items+=("$ssupdate_path")
+
+  unit_path="$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null || true)"
+  [ -n "$unit_path" ] && [ -f "$unit_path" ] && items+=("$unit_path")
+
+  if [ -d "/etc/systemd/system/${SERVICE}.service.d" ]; then
+    items+=("/etc/systemd/system/${SERVICE}.service.d")
+  fi
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    echo "没有找到可备份的文件。"
+    pause
+    return
+  fi
+
+  for item in "${items[@]}"; do
+    rel_items+=("${item#/}")
+  done
+
+  if tar -C / -czf "$outfile" "${rel_items[@]}"; then
+    echo
+    echo "备份完成："
+    echo "$outfile"
+    echo
+    echo "建议以后把这个文件下载到自己的电脑保存。"
+  else
+    echo "备份失败。"
+    rm -f "$outfile"
+  fi
+
+  pause
+}
+
+restore_config() {
+  mkdir -p "$BACKUP_DIR"
+
+  echo "现有备份："
+  echo "------------------------------"
+  ls -1t "$BACKUP_DIR"/ssmenu-backup-*.tar.gz 2>/dev/null || echo "暂无本机备份"
+  echo "------------------------------"
+  echo
+  read -rp "请输入要恢复的 .tar.gz 文件完整路径（直接回车取消）: " file
+
+  [ -z "$file" ] && return
+
+  if [ ! -f "$file" ]; then
+    echo "文件不存在。"
+    pause
+    return
+  fi
+
+  if ! tar -tzf "$file" >/dev/null 2>&1; then
+    echo "备份文件无效或已损坏。"
+    pause
+    return
+  fi
+
+  if tar -tzf "$file" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+    echo "备份文件路径异常，已停止恢复。"
+    pause
+    return
+  fi
+
+  echo
+  read -rp "确定恢复这个备份吗？[y/N]: " yn
+  case "$yn" in
+    y|Y) ;;
+    *)
+      echo "已取消。"
+      pause
+      return
+      ;;
+  esac
+
+  local tmp
+  local unit_file
+
+  tmp="$(mktemp -d)"
+
+  if ! tar -xzf "$file" -C "$tmp"; then
+    echo "解压失败。"
+    rm -rf "$tmp"
+    pause
+    return
+  fi
+
+  if [ -f "$tmp/etc/shadowsocks-rust/config.json" ]; then
+    mkdir -p /etc/shadowsocks-rust
+    cp -a "$tmp/etc/shadowsocks-rust/config.json" "$CONFIG"
+    echo "已恢复 Shadowsocks 配置"
+  fi
+
+  if [ -f "$tmp/usr/local/bin/ssmenu" ]; then
+    cp -a "$tmp/usr/local/bin/ssmenu" /usr/local/bin/ssmenu
+    chmod +x /usr/local/bin/ssmenu
+    echo "已恢复 ssmenu"
+  fi
+
+  if [ -f "$tmp/usr/local/bin/ssupdate" ]; then
+    cp -a "$tmp/usr/local/bin/ssupdate" /usr/local/bin/ssupdate
+    chmod +x /usr/local/bin/ssupdate
+    echo "已恢复 ssupdate"
+  fi
+
+  unit_file="$(find "$tmp" -type f -name "${SERVICE}.service" 2>/dev/null | head -n 1)"
+  if [ -n "$unit_file" ]; then
+    cp -a "$unit_file" "/etc/systemd/system/${SERVICE}.service"
+    echo "已恢复 systemd 服务文件"
+  fi
+
+  if [ -d "$tmp/etc/systemd/system/${SERVICE}.service.d" ]; then
+    rm -rf "/etc/systemd/system/${SERVICE}.service.d"
+    cp -a "$tmp/etc/systemd/system/${SERVICE}.service.d" "/etc/systemd/system/"
+    echo "已恢复 systemd 附加配置"
+  fi
+
+  rm -rf "$tmp"
+  systemctl daemon-reload
+
+  echo
+  read -rp "恢复完成。是否立即重启 Shadowsocks？[Y/n]: " yn
+  case "$yn" in
+    n|N) ;;
+    *)
+      systemctl restart "$SERVICE"
+      echo "已重启"
+      ;;
+  esac
+
+  pause
+}
+
+autostart_menu() {
+  local state
+  state="$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+
+  echo "当前开机自启状态：${state:-未知}"
+  echo
+  echo "1. 开启开机自启"
+  echo "2. 关闭开机自启"
+  echo "0. 返回"
+  echo
+  read -rp "请选择: " n
+
+  case "$n" in
+    1)
+      systemctl enable "$SERVICE"
+      echo "已开启开机自启"
+      ;;
+    2)
+      systemctl disable "$SERVICE"
+      echo "已关闭开机自启"
+      ;;
+    0)
+      return
+      ;;
+    *)
+      echo "输入无效"
+      ;;
+  esac
+
+  pause
+}
+
+
+outbound_menu() {
+  local current ipv4 ipv6 choice addr label
+
+  current="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("outbound_bind_addr", "自动"))' "$CONFIG" 2>/dev/null || echo "读取失败")"
+  ipv4="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+  ipv6="$(ip -6 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+
+  echo "========== 出站地址选择 =========="
+  echo "当前设置 : $current"
+  echo "IPv4     : ${ipv4:-不可用}"
+  echo "IPv6     : ${ipv6:-不可用}"
+  echo
+  echo "1. 使用 IPv4 出站"
+  echo "2. 使用 IPv6 出站"
+  echo "3. 自动选择"
+  echo "0. 返回"
+  echo
+  read -rp "请选择: " choice
+
+  case "$choice" in
+    1)
+      [ -n "$ipv4" ] || { echo "没有可用 IPv4"; pause; return; }
+      addr="$ipv4"
+      label="IPv4"
+      ;;
+    2)
+      [ -n "$ipv6" ] || { echo "没有可用 IPv6"; pause; return; }
+      addr="$ipv6"
+      label="IPv6"
+      ;;
+    3)
+      addr=""
+      label="自动"
+      ;;
+    0)
+      return
+      ;;
+    *)
+      echo "输入无效"
+      pause
+      return
+      ;;
+  esac
+
+  cp -a "$CONFIG" "$CONFIG.outbound.bak"
+
+  python3 - "$CONFIG" "$addr" <<'PYCFG'
+import json, sys
+
+path = sys.argv[1]
+addr = sys.argv[2]
+
+with open(path, "r") as f:
+    cfg = json.load(f)
+
+if addr:
+    cfg["outbound_bind_addr"] = addr
+else:
+    cfg.pop("outbound_bind_addr", None)
+
+with open(path, "w") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PYCFG
+
+  if systemctl restart "$SERVICE" && systemctl is-active --quiet "$SERVICE"; then
+    rm -f "$CONFIG.outbound.bak"
+    echo
+    echo "已切换为：$label 出站"
+  else
+    echo
+    echo "启动失败，正在恢复原配置..."
+    cp -a "$CONFIG.outbound.bak" "$CONFIG"
+    rm -f "$CONFIG.outbound.bak"
+    systemctl restart "$SERVICE"
+    echo "已恢复原配置。"
+  fi
+
+  pause
+}
+
+
+bbr_menu() {
+  local cc qdisc available
+
+  clear
+  echo "========== BBR 状态 =========="
+  echo
+
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")"
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "未知")"
+
+  echo "当前拥塞控制 : $cc"
+  echo "当前队列算法 : $qdisc"
+  echo "可用算法     : $available"
+  echo
+
+  if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
+    echo "[OK] BBR 已经开启并正常运行。"
+    echo
+    pause
+    return
+  fi
+
+  if ! echo "$available" | grep -qw bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  fi
+
+  if ! echo "$available" | grep -qw bbr; then
+    echo "[异常] 当前内核没有检测到 BBR 支持。"
+    pause
+    return
+  fi
+
+  echo "当前 BBR 尚未完整启用。"
+  echo
+  read -rp "是否现在开启 BBR？[y/N]: " yn
+
+  case "$yn" in
+    y|Y)
+      cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+      sysctl -p /etc/sysctl.d/99-bbr.conf
+
+      echo
+      cc="$(sysctl -n net.ipv4.tcp_congestion_control)"
+      qdisc="$(sysctl -n net.core.default_qdisc)"
+
+      if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
+        echo "[OK] BBR 已成功开启。"
+      else
+        echo "[异常] BBR 设置未完全生效。"
+      fi
+      ;;
+    *)
+      echo "已取消。"
+      ;;
+  esac
+
+  pause
+}
+
+
+change_port() {
+  local current newport
+
+  current="$(config_value server_port)"
+
+  clear
+  echo "========== 快速修改端口 =========="
+  echo
+  echo "当前端口：$current"
+  echo
+  read -rp "请输入新端口（1-65535，直接回车取消）: " newport
+
+  [ -z "$newport" ] && return
+
+  if ! [[ "$newport" =~ ^[0-9]+$ ]] || [ "$newport" -lt 1 ] || [ "$newport" -gt 65535 ]; then
+    echo
+    echo "端口无效，请输入 1-65535 之间的数字。"
+    pause
+    return
+  fi
+
+  if [ "$newport" = "$current" ]; then
+    echo
+    echo "新端口和当前端口相同，无需修改。"
+    pause
+    return
+  fi
+
+  cp -a "$CONFIG" "$CONFIG.port.bak"
+
+  python3 - "$CONFIG" "$newport" <<'PYCFG'
+import json, sys
+
+path = sys.argv[1]
+port = int(sys.argv[2])
+
+with open(path, "r") as f:
+    cfg = json.load(f)
+
+cfg["server_port"] = port
+
+with open(path, "w") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PYCFG
+
+  echo
+  echo "正在重启 Shadowsocks..."
+
+  if systemctl restart "$SERVICE" && systemctl is-active --quiet "$SERVICE"; then
+    rm -f "$CONFIG.port.bak"
+    echo
+    echo "[OK] 端口修改成功：$current → $newport"
+    echo
+    echo "注意："
+    echo "1. 客户端也要改成新端口 $newport"
+    echo "2. VPS 防火墙/安全组需放行 TCP + UDP $newport"
+  else
+    echo
+    echo "[异常] Shadowsocks 启动失败，正在恢复原端口..."
+    cp -a "$CONFIG.port.bak" "$CONFIG"
+    rm -f "$CONFIG.port.bak"
+    systemctl restart "$SERVICE"
+    echo "已恢复原配置，端口仍为 $current"
+  fi
+
+  pause
+}
+
+self_check() {
+  local port
+
+  echo "========== 运行环境自检 =========="
+  echo
+
+  if command -v ssserver >/dev/null 2>&1; then
+    echo "[OK] ssserver 已安装"
+  else
+    echo "[异常] 找不到 ssserver"
+  fi
+
+  if [ -f "$CONFIG" ]; then
+    echo "[OK] 配置文件存在"
+  else
+    echo "[异常] 配置文件不存在：$CONFIG"
+  fi
+
+  if [ -f "$CONFIG" ] && python3 -m json.tool "$CONFIG" >/dev/null 2>&1; then
+    echo "[OK] config.json 格式正常"
+  else
+    echo "[异常] config.json 格式错误"
+  fi
+
+  if systemctl cat "$SERVICE" >/dev/null 2>&1; then
+    echo "[OK] systemd 服务存在"
+  else
+    echo "[异常] systemd 服务不存在"
+  fi
+
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo "[OK] Shadowsocks 服务正在运行"
+  else
+    echo "[异常] Shadowsocks 服务没有运行"
+  fi
+
+  port="$(config_value server_port)"
+
+  if [ "$port" != "未知" ] && command -v ss >/dev/null 2>&1; then
+    if ss -lntup 2>/dev/null | grep -Eq ":${port}([[:space:]]|$)"; then
+      echo "[OK] 端口 $port 正在监听"
+    else
+      echo "[异常] 没有检测到端口 $port"
+    fi
+  else
+    echo "[提示] 无法检查监听端口"
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -4fsS --max-time 5 https://api.ipify.org >/dev/null 2>&1; then
+      echo "[OK] IPv4 出站正常"
+    else
+      echo "[异常] IPv4 出站检测失败"
+    fi
+
+    if curl -6fsS --max-time 5 https://api64.ipify.org >/dev/null 2>&1; then
+      echo "[OK] IPv6 出站正常"
+    else
+      echo "[提示] IPv6 不可用或出站失败"
+    fi
+  else
+    echo "[提示] 未安装 curl，跳过公网出站检测"
+  fi
+
+  echo
+  echo "=================================="
+  pause
+}
+
+server_info() {
+  local os
+  local port
+  local method
+  local active
+  local enabled
+  local ipv4
+  local ipv6
+
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    os="${PRETTY_NAME:-未知}"
+  else
+    os="未知"
+  fi
+
+  port="$(config_value server_port)"
+  method="$(config_value method)"
+
+  if systemctl is-active --quiet "$SERVICE"; then
+    active="运行中"
+  else
+    active="未运行"
+  fi
+
+  enabled="$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+  ipv4="$(get_public_ip 4)"
+  ipv6="$(get_public_ip 6)"
+
+  echo "========== 服务器连接信息 =========="
+  echo "主机名      : $(hostname)"
+  echo "系统        : $os"
+  echo "CPU 架构    : $(uname -m)"
+  echo "公网 IPv4   : $ipv4"
+  echo "公网 IPv6   : $ipv6"
+  echo "服务状态    : $active"
+  echo "开机自启    : ${enabled:-未知}"
+  echo "监听端口    : $port"
+  echo "加密方式    : $method"
+  echo "配置文件    : $CONFIG"
+  echo "===================================="
+  pause
+}
+
+while true; do
+  clear
+  echo "=============================="
+  echo " Shadowsocks Rust 管理菜单"
+  echo "=============================="
+  echo "1. 查看运行状态"
+  echo "2. 启动服务"
+  echo "3. 停止服务"
+  echo "4. 重启服务"
+  echo "5. 查看配置"
+  echo "6. 编辑配置"
+  echo "7. 生成 ss:// 链接和二维码"
+  echo "8. 查看实时日志"
+  echo "9. 查看版本"
+  echo "10. 检查并更新"
+  echo "11. 备份当前配置"
+  echo "12. 恢复配置"
+  echo "13. 开机自启管理"
+  echo "14. 运行环境自检"
+  echo "15. 查看服务器连接信息"
+  echo "16. 选择 IPv4 / IPv6 出站"
+  echo "17. 开启 / 检查 BBR"
+  echo "18. 快速修改端口"
+  echo "0. 退出"
+  echo "=============================="
+  read -rp "请选择: " choice
+
+  case "$choice" in
+    1)
+      systemctl status "$SERVICE" --no-pager
+      pause
+      ;;
+    2)
+      systemctl start "$SERVICE"
+      echo "已启动"
+      pause
+      ;;
+    3)
+      systemctl stop "$SERVICE"
+      echo "已停止"
+      pause
+      ;;
+    4)
+      systemctl restart "$SERVICE"
+      echo "已重启"
+      pause
+      ;;
+    5)
+      cat "$CONFIG"
+      pause
+      ;;
+    6)
+      nano "$CONFIG"
+      echo
+      read -rp "是否立即重启服务使配置生效？[Y/n]: " yn
+      case "$yn" in
+        n|N) ;;
+        *)
+          systemctl restart "$SERVICE"
+          echo "已重启"
+          ;;
+      esac
+      pause
+      ;;
+    7)
+      LINK="$(share_link)"
+      echo
+      echo "$LINK"
+      echo
+      if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "$LINK"
+      else
+        echo "未安装 qrencode"
+      fi
+      echo
+      echo "注意：上面的链接和二维码包含你的密码，请勿公开。"
+      pause
+      ;;
+    8)
+      echo "按 Ctrl+C 退出日志"
+      sleep 1
+      journalctl -u "$SERVICE" -f
+      ;;
+    9)
+      ssserver --version
+      pause
+      ;;
+    10)
+      ssupdate
+      pause
+      ;;
+    11)
+      backup_config
+      ;;
+    12)
+      restore_config
+      ;;
+    13)
+      autostart_menu
+      ;;
+    14)
+      self_check
+      ;;
+    15)
+      server_info
+      ;;
+    16)
+      outbound_menu
+      ;;
+    17)
+      bbr_menu
+      ;;
+    18)
+      change_port
+      ;;
+    0)
+      exit 0
+      ;;
+    *)
+      echo "输入无效"
+      sleep 1
+      ;;
+  esac
+done

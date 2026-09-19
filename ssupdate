@@ -1,0 +1,61 @@
+#!/bin/bash
+set -u
+
+SERVICE="shadowsocks-rust"
+BIN="/usr/local/bin/ssserver"
+
+CURRENT="$($BIN --version 2>/dev/null | awk '{print $2}')"
+LATEST_TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/shadowsocks/shadowsocks-rust/releases/latest | sed 's#.*/##')"
+
+if [ -z "$LATEST_TAG" ]; then
+  echo "获取最新版本失败。"
+  exit 1
+fi
+
+LATEST="${LATEST_TAG#v}"
+
+echo "当前版本: $CURRENT"
+echo "最新版本: $LATEST"
+
+if [ "$CURRENT" = "$LATEST" ]; then
+  echo "已经是最新版本，无需更新。"
+  exit 0
+fi
+
+read -r -p "是否更新到 $LATEST？[y/N]: " yn
+case "$yn" in
+  y|Y) ;;
+  *) echo "已取消"; exit 0 ;;
+esac
+
+case "$(uname -m)" in
+  x86_64) TARGET="x86_64-unknown-linux-musl" ;;
+  aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+  *) echo "不支持的架构: $(uname -m)"; exit 1 ;;
+esac
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST_TAG}/shadowsocks-${LATEST_TAG}.${TARGET}.tar.xz"
+
+echo "正在下载 $LATEST_TAG ..."
+
+curl -fL "$URL" -o "$TMP/shadowsocks.tar.xz" || exit 1
+tar -xJf "$TMP/shadowsocks.tar.xz" -C "$TMP" || exit 1
+
+cp "$BIN" "${BIN}.bak"
+install -m 755 "$TMP/ssserver" "$BIN"
+
+echo "正在重启服务..."
+
+if systemctl restart "$SERVICE" && sleep 2 && systemctl is-active --quiet "$SERVICE"; then
+  echo "更新成功！"
+  "$BIN" --version
+else
+  echo "新版本启动失败，正在恢复旧版本..."
+  cp "${BIN}.bak" "$BIN"
+  systemctl restart "$SERVICE"
+  echo "已恢复旧版本。"
+  exit 1
+fi

@@ -21,7 +21,7 @@ Shadowsocks Rust 一键安装、更新及管理工具。
 全新 VPS 或已有 Shadowsocks Rust 的 VPS 都可以执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/lph112358/SS-Rust-Manager/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/GhostForgeLab/SS-Rust-Manager/main/install.sh)
 ```
 
 安装完成：

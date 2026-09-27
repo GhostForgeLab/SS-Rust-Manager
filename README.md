@@ -2,6 +2,15 @@
 
 Shadowsocks Rust 一键安装、更新及管理工具。
 
+## v1.1.1 修复
+
+- 修复 Debian 12 全新 VPS 安装时初始化不完整的问题
+- 安装结束检查 `ssserver`、`ssmenu`、配置、systemd 服务文件及服务运行状态；未通过时报告失败
+- 修复 `config.json` 和 systemd 服务文件缺失时无法从菜单恢复的问题；已有配置不会覆盖
+- 修复 `install.sh` 的 RAW 下载地址，改为 `GhostForgeLab/SS-Rust-Manager`
+- 修复远程安装和更新成功后临时目录清理可能导致的错误退出
+- 菜单 `19` 在更新或重装后完成初始化检查，新增 `20. 修复安装环境`
+
 ## v1.1.0 新增
 
 - 全新 Debian VPS 可直接安装官方 `ssserver`
@@ -70,6 +79,7 @@ ssmenu
 17. 开启 / 检查 BBR
 18. 快速修改端口
 19. 安装 / 重装 Shadowsocks Rust
+20. 修复安装环境
 0.  退出
 ```
 
@@ -87,14 +97,15 @@ ssmenu
 ## Release 离线安装
 
 ```bash
-tar -xzf SS-Rust-Manager-v1.1.0.tar.gz
-cd SS-Rust-Manager-v1.1.0
+tar -xzf SS-Rust-Manager-v1.1.1.tar.gz
+cd SS-Rust-Manager-v1.1.1
 bash install.sh
 ```
 
 ## 已验证/目标环境
 
 - Debian 13
+- Debian 12（全新安装及缺失文件修复需在 VPS 实测）
 - systemd
 - x86_64 / aarch64
 - Shadowsocks Rust 官方 Release

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/lph112358/SS-Rust-Manager/main"
+REPO_RAW="https://raw.githubusercontent.com/GhostForgeLab/SS-Rust-Manager/main"
 CONFIG_DIR="/etc/shadowsocks-rust"
 CONFIG="$CONFIG_DIR/config.json"
 SERVICE_FILE="/etc/systemd/system/shadowsocks-rust.service"
@@ -25,7 +25,7 @@ install_deps() {
 }
 
 install_manager_files() {
-  local here td
+  local here td cleanup_cmd
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
   td=""
 
@@ -34,7 +34,8 @@ install_manager_files() {
     install -m 0755 "$here/ssupdate" /usr/local/bin/ssupdate
   else
     td="$(mktemp -d)"
-    trap 'rm -rf "$td"' EXIT
+    printf -v cleanup_cmd 'rm -rf -- %q' "$td"
+    trap "$cleanup_cmd" EXIT
     echo "从 GitHub 下载管理脚本..."
     curl -fsSL --retry 3 "$REPO_RAW/ssmenu" -o "$td/ssmenu"
     curl -fsSL --retry 3 "$REPO_RAW/ssupdate" -o "$td/ssupdate"
@@ -45,7 +46,7 @@ install_manager_files() {
 
 create_config_if_missing() {
   mkdir -p "$CONFIG_DIR"
-  if [[ -f "$CONFIG" ]]; then
+  if [[ -e "$CONFIG" || -L "$CONFIG" ]]; then
     echo "检测到现有配置：$CONFIG"
     echo "已保护，不覆盖。"
     return
@@ -73,7 +74,7 @@ create_config_if_missing() {
     password="$(openssl rand -base64 24 | tr -d '\n')"
   fi
 
-  python3 - "$CONFIG" "$port" "$method" "$password" <<'PY'
+  (umask 077; python3 - "$CONFIG" "$port" "$method" "$password" <<'PY'
 import json, sys
 path, port, method, password = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 data = {
@@ -83,10 +84,11 @@ data = {
     "method": method,
     "mode": "tcp_and_udp"
 }
-with open(path, "w", encoding="utf-8") as f:
+with open(path, "x", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
 PY
+  )
   chmod 600 "$CONFIG"
 
   echo
@@ -98,7 +100,7 @@ PY
 }
 
 create_service_if_missing() {
-  if [[ -f "$SERVICE_FILE" ]]; then
+  if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]]; then
     echo "检测到现有 systemd 服务文件，已保留：$SERVICE_FILE"
     return
   fi
@@ -119,6 +121,16 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+}
+
+verify_install() {
+  local failed=0
+  if [[ -x /usr/local/bin/ssserver ]]; then echo "[ OK ] ssserver"; else echo "[FAIL] ssserver 缺失"; failed=1; fi
+  if [[ -x /usr/local/bin/ssmenu ]]; then echo "[ OK ] ssmenu"; else echo "[FAIL] ssmenu 缺失"; failed=1; fi
+  if [[ -f "$CONFIG" ]]; then echo "[ OK ] config.json"; else echo "[FAIL] config.json 缺失"; failed=1; fi
+  if [[ -f "$SERVICE_FILE" ]]; then echo "[ OK ] systemd 服务文件"; else echo "[FAIL] systemd 服务文件缺失"; failed=1; fi
+  if systemctl is-active --quiet "$SERVICE"; then echo "[ OK ] 服务正在运行"; else echo "[FAIL] 服务未运行"; failed=1; fi
+  ((failed == 0))
 }
 
 main() {
@@ -147,8 +159,15 @@ main() {
   fi
 
   echo
+  echo "=== 安装完成检测 ==="
+  if ! verify_install; then
+    echo "安装未完成，请检查以上失败项或运行 ssmenu -> 20. 修复安装环境。" >&2
+    return 1
+  fi
+
+  echo
   echo "=================================="
-  echo "SS-Rust-Manager v1.1.0 安装完成"
+  echo "SS-Rust-Manager v1.1.1 安装完成"
   echo "=================================="
   echo "运行管理菜单：ssmenu"
 }

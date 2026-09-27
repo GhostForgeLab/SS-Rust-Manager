@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_API="https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest"
 BIN="/usr/local/bin/ssserver"
 SERVICE="shadowsocks-rust.service"
+SERVICE_FILE="/etc/systemd/system/$SERVICE"
 CONFIG="/etc/shadowsocks-rust/config.json"
 
 need_root() {
@@ -51,7 +52,7 @@ download_and_install() {
   need_root
   need_cmds
 
-  local json tag ver suffix asset url sha_url td
+  local json tag ver suffix asset url sha_url td cleanup_cmd
   json="$(latest_info)"
   tag="$(jq -r '.tag_name' <<<"$json")"
   ver="${tag#v}"
@@ -65,7 +66,8 @@ download_and_install() {
   [[ -n "$sha_url" && "$sha_url" != "null" ]] || { echo "错误：官方 Release 未找到校验文件：${asset}.sha256"; exit 1; }
 
   td="$(mktemp -d)"
-  trap 'rm -rf "$td"' EXIT
+  printf -v cleanup_cmd 'rm -rf -- %q' "$td"
+  trap "$cleanup_cmd" EXIT
 
   echo "官方最新版本：$tag"
   echo "架构：$(uname -m)"
@@ -104,7 +106,7 @@ download_and_install() {
 
   install -m 0755 "$newbin" "$BIN"
 
-  if systemctl list-unit-files "$SERVICE" >/dev/null 2>&1 && [[ -f "$CONFIG" ]]; then
+  if [[ -f "$SERVICE_FILE" && -f "$CONFIG" ]]; then
     if systemctl restart "$SERVICE"; then
       echo "服务重启成功。"
     else

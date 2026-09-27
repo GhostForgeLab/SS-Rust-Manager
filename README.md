@@ -2,6 +2,13 @@
 
 Shadowsocks Rust 一键安装、更新及管理工具。
 
+## v1.1.2 新增
+
+- 首次安装及菜单 `20` 修复缺失配置时，可选择 `2022-blake3-aes-128-gcm` 或 `2022-blake3-aes-256-gcm`
+- SS2022 按加密方式生成 16/32 字节随机密钥；手动输入时检查 Base64 格式与密钥长度
+- 菜单 `7` 为 SS2022 生成符合 SIP002 的明文且经百分号转义的 `ss://` 链接和二维码
+- 已有 `config.json` 仍会保留；重新运行安装脚本不会修改现有加密方式
+
 ## v1.1.1 修复
 
 - 修复 Debian 12 全新 VPS 安装时初始化不完整的问题
@@ -97,8 +104,8 @@ ssmenu
 ## Release 离线安装
 
 ```bash
-tar -xzf SS-Rust-Manager-v1.1.1.tar.gz
-cd SS-Rust-Manager-v1.1.1
+tar -xzf SS-Rust-Manager-v1.1.2.tar.gz
+cd SS-Rust-Manager-v1.1.2
 bash install.sh
 ```
 

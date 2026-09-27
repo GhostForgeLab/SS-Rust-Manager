@@ -54,7 +54,7 @@ create_config_if_missing() {
 
   echo
   echo "=== 首次创建 Shadowsocks Rust 配置 ==="
-  local port method_choice method password
+  local port method_choice method password key_bytes=0
   read -r -p "监听端口 [8388]：" port
   port="${port:-8388}"
   [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { echo "端口无效"; exit 1; }
@@ -62,16 +62,41 @@ create_config_if_missing() {
   echo "加密方式："
   echo "1. chacha20-ietf-poly1305（默认）"
   echo "2. aes-256-gcm"
+  echo "3. 2022-blake3-aes-128-gcm（SS2022）"
+  echo "4. 2022-blake3-aes-256-gcm（SS2022）"
   read -r -p "选择 [1]：" method_choice
   case "${method_choice:-1}" in
     1) method="chacha20-ietf-poly1305" ;;
     2) method="aes-256-gcm" ;;
+    3) method="2022-blake3-aes-128-gcm"; key_bytes=16 ;;
+    4) method="2022-blake3-aes-256-gcm"; key_bytes=32 ;;
     *) echo "选择无效"; exit 1 ;;
   esac
 
-  read -r -p "密码（直接回车自动生成）：" password
-  if [[ -z "$password" ]]; then
-    password="$(openssl rand -base64 24 | tr -d '\n')"
+  if ((key_bytes)); then
+    echo "SS2022 需要 $key_bytes 字节随机密钥（Base64 编码），不能使用普通自定义密码。"
+    read -r -p "密钥（直接回车自动生成）：" password
+    if [[ -z "$password" ]]; then
+      password="$(openssl rand -base64 "$key_bytes" | tr -d '\n')"
+    fi
+    if ! python3 - "$password" "$key_bytes" <<'PY'
+import base64, sys
+try:
+    key = base64.b64decode(sys.argv[1], validate=True)
+    valid = len(key) == int(sys.argv[2]) and base64.b64encode(key).decode() == sys.argv[1]
+except (ValueError, UnicodeError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+    then
+      echo "密钥无效：请使用 $key_bytes 字节随机密钥的标准 Base64 编码。" >&2
+      exit 1
+    fi
+  else
+    read -r -p "密码（直接回车自动生成）：" password
+    if [[ -z "$password" ]]; then
+      password="$(openssl rand -base64 24 | tr -d '\n')"
+    fi
   fi
 
   (umask 077; python3 - "$CONFIG" "$port" "$method" "$password" <<'PY'
@@ -95,7 +120,7 @@ PY
   echo "配置已创建：$CONFIG"
   echo "端口：$port"
   echo "加密：$method"
-  echo "密码：$password"
+  echo "密钥/密码：$password"
   echo "请保存好以上信息。"
 }
 
@@ -167,7 +192,7 @@ main() {
 
   echo
   echo "=================================="
-  echo "SS-Rust-Manager v1.1.1 安装完成"
+  echo "SS-Rust-Manager v1.1.2 安装完成"
   echo "=================================="
   echo "运行管理菜单：ssmenu"
 }

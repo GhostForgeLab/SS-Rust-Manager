@@ -85,15 +85,132 @@ edit_config() {
 public_ip4() { curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true; }
 public_ip6() { curl -6 -fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true; }
 
+inbound_mode() {
+  python3 - "$CONFIG" <<'PY'
+import ipaddress, json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+    if "servers" in d:
+        raise ValueError("multiple servers")
+    addr = ipaddress.ip_address(d.get("server", ""))
+    if addr.version == 4:
+        print("ipv4")
+    elif str(addr) == "::" and not d.get("ipv6_only", False):
+        print("dual")
+    else:
+        print("ipv6")
+except (OSError, ValueError, TypeError, AttributeError):
+    print("custom")
+PY
+}
+
+inbound_info() {
+  local label
+  case "$(inbound_mode)" in
+    ipv4) label="仅 IPv4" ;;
+    ipv6) label="仅 IPv6" ;;
+    dual) label="IPv4 + IPv6 双栈" ;;
+    *) label="自定义/多服务器配置" ;;
+  esac
+  echo "入站监听：$label（server=$(json_get server)，ipv6_only=$(json_get ipv6_only)）"
+}
+
+# Back up once, then update both listener fields in one atomic replacement.
+# Print only the backup path so the caller can restore this exact configuration.
+set_inbound_mode() {
+  python3 - "$CONFIG" "$BACKUP_DIR" "$1" <<'PY'
+import datetime, ipaddress, json, os, shutil, sys, tempfile
+p, backup_dir, mode = sys.argv[1:]
+tmp = None
+try:
+    settings = {"ipv4": ("0.0.0.0", False), "ipv6": ("::", True), "dual": ("::", False)}
+    server, ipv6_only = settings[mode]
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict) or "servers" in d:
+        raise ValueError("多服务器配置请使用菜单 6 手动编辑")
+    ipaddress.ip_address(d.get("server", ""))
+    if not d.get("server_port"):
+        raise ValueError("缺少 server_port")
+    os.makedirs(backup_dir, exist_ok=True)
+    prefix = "config-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-"
+    fd, backup = tempfile.mkstemp(prefix=prefix, suffix=".json", dir=backup_dir)
+    os.close(fd)
+    shutil.copyfile(p, backup)
+    d.update(server=server, ipv6_only=ipv6_only)
+    fd, tmp = tempfile.mkstemp(prefix=".config.", dir=os.path.dirname(p))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+    tmp = None
+    print(backup)
+except (OSError, ValueError, KeyError, TypeError) as e:
+    print(f"入站设置未应用：{e}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    if tmp is not None:
+        os.unlink(tmp)
+PY
+}
+
+choose_inbound() {
+  [[ -f "$CONFIG" ]] || { echo "配置不存在：$CONFIG"; return 1; }
+  inbound_info
+  echo "设置客户端连接 VPS 的地址类型，不改变出站设置。"
+  echo "将监听所选类型的所有本机地址；端口、密码和加密方式保持原值。"
+  echo "1. 仅 IPv4"
+  echo "2. 仅 IPv6"
+  echo "3. IPv4 + IPv6 双栈"
+  echo "0. 返回"
+  local n mode backup
+  read -r -p "选择：" n || return
+  case "$n" in
+    1) mode="ipv4" ;;
+    2) mode="ipv6" ;;
+    3) mode="dual" ;;
+    0) return ;;
+    *) echo "选择无效"; return 1 ;;
+  esac
+  backup="$(set_inbound_mode "$mode")" || return 1
+  echo "备份完成：$backup"
+  if systemctl restart "$SERVICE" && sleep 1 && systemctl is-active --quiet "$SERVICE"; then
+    echo "入站设置已应用。"
+    inbound_info
+    echo "请确保所选地址类型的防火墙/安全组已放行 SS 端口（TCP/UDP）。"
+  else
+    echo "服务启动失败，正在恢复原配置。" >&2
+    if cp -a -- "$backup" "$CONFIG"; then
+      if systemctl restart "$SERVICE" && sleep 1 && systemctl is-active --quiet "$SERVICE"; then
+        echo "已恢复原配置并重新启动服务。" >&2
+      else
+        echo "原配置已恢复，但服务仍未启动，请查看菜单 8 的日志。" >&2
+      fi
+    else
+      echo "恢复失败，请从 $backup 手动恢复配置。" >&2
+    fi
+    return 1
+  fi
+}
+
 show_ss_url() {
   [[ -f "$CONFIG" ]] || { echo "配置不存在"; return; }
-  local port method password host userinfo url
+  local port method password host userinfo url mode ip4="" ip6=""
   port="$(json_get server_port)"
   method="$(json_get method)"
   password="$(json_get password)"
-  host="$(public_ip4)"
-  [[ -n "$host" ]] || host="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -n "$host" ]] || { echo "无法获取服务器 IP"; return; }
+  mode="$(inbound_mode)"
+  case "$mode" in
+    ipv4) ip4="$(public_ip4)" ;;
+    ipv6) ip6="$(public_ip6)" ;;
+    dual) ip4="$(public_ip4)"; ip6="$(public_ip6)" ;;
+    *) echo "自定义/多服务器配置，请根据实际监听地址手动创建链接。"; return 1 ;;
+  esac
+  [[ -n "$ip4" || -n "$ip6" ]] || { echo "无法获取当前监听类型的公网 IP，请检查网络或手动填写地址。"; return 1; }
+  if [[ "$mode" == "dual" && ( -z "$ip4" || -z "$ip6" ) ]]; then
+    echo "未获取到其中一种公网 IP，仅生成已获取地址的链接。"
+  fi
 
 userinfo="$(python3 - "$method" "$password" <<'PY'
 import base64,sys,urllib.parse
@@ -105,13 +222,22 @@ else:
     print(base64.urlsafe_b64encode(s).decode().rstrip("="))
 PY
 )"
-  url="ss://${userinfo}@${host}:${port}"
-  echo
-  echo "$url"
-  echo
-  if command -v qrencode >/dev/null 2>&1; then
-    qrencode -t ANSIUTF8 "$url" || true
-  fi
+  for host in "$ip4" "$ip6"; do
+    [[ -n "$host" ]] || continue
+    if [[ "$host" == *:* ]]; then
+      echo "IPv6 链接："
+      host="[$host]"
+    else
+      echo "IPv4 链接："
+    fi
+    url="ss://${userinfo}@${host}:${port}"
+    echo
+    echo "$url"
+    echo
+    if command -v qrencode >/dev/null 2>&1; then
+      qrencode -t ANSIUTF8 "$url" || true
+    fi
+  done
 }
 
 show_logs() { journalctl -u "$SERVICE" -f -n 80; }
@@ -189,6 +315,7 @@ connection_info() {
   echo "端口：$(json_get server_port)"
   echo "加密：$(json_get method)"
   echo "模式：$(json_get mode)"
+  inbound_info
   echo "出站绑定：$(json_get outbound_bind_addr)"
 }
 
@@ -402,7 +529,7 @@ install_reinstall_menu() {
 menu() {
   clear
   hr
-  echo " Shadowsocks Rust 管理菜单 v1.1.2"
+  echo " Shadowsocks Rust 管理菜单 v1.1.3"
   hr
   echo "1. 查看运行状态"
   echo "2. 启动服务"
@@ -424,6 +551,7 @@ menu() {
   echo "18. 快速修改端口"
   echo "19. 安装 / 重装 Shadowsocks Rust"
   echo "20. 修复安装环境"
+  echo "21. 设置 IPv4 / IPv6 入站监听"
   echo "0. 退出"
   hr
 }
@@ -455,6 +583,7 @@ main() {
       18) change_port; pause ;;
       19) install_reinstall_menu; pause ;;
       20) repair_install; pause ;;
+      21) choose_inbound; pause ;;
       0) exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
@@ -462,3 +591,4 @@ main() {
 }
 
 main "$@"
+

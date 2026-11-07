@@ -192,9 +192,10 @@ main() {
 
   echo
   echo "=================================="
-  echo "SS-Rust-Manager v1.1.2 安装完成"
+  echo "SS-Rust-Manager v1.1.3 安装完成"
   echo "=================================="
   echo "运行管理菜单：ssmenu"
 }
 
 main "$@"
+
